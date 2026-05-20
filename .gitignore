@@ -1,2 +1,6 @@
-*.csv
 *.npz
+*.csv
+*.pyc
+*.npy
+*.log
+*venv
