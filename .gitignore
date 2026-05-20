@@ -4,3 +4,4 @@
 *.npy
 *.log
 *venv
+/results
