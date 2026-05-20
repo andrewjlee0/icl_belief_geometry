@@ -9,7 +9,9 @@ Entry (A, B) = R² of probing family A's activations for family B's beliefs
 
 Outputs: between_{model}.csv
 """
-import argparse, gc, os, sys
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+import argparse, gc, sys
 import numpy as np, pandas as pd, torch
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm

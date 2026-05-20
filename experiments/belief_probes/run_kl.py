@@ -3,7 +3,9 @@
 Uses fullvocab KL (lm_head over entire vocabulary for proper normalization).
 Outputs: kl_{model}.csv (100-token rolling average per position).
 """
-import argparse, gc, os, sys
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+import argparse, gc, sys
 import numpy as np, pandas as pd, torch
 from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
