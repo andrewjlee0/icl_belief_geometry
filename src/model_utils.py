@@ -109,23 +109,49 @@ def extract_activations_chunked(wrapper, input_ids, layers, positions, chunk_siz
     hidden_cat = torch.cat(all_hidden, dim=0) if collect_hidden else None
     return acts, hidden_cat
 
+# def compute_fullvocab_kl(model, hidden_cat, pos_indices, n_matched, ntp_true, tok_ids, device="cuda"):
+#     """Compute KL(HMM || LLM) using lm_head over full vocabulary for proper normalization."""
+#     from .metrics.kl import kl_divergence
+#     hidden = hidden_cat.to(device)
+#     W = model.lm_head.weight
+#     hidden = hidden.float()
+#     W = W.float()
+#     hmm_logits = (hidden @ W[tok_ids].T)
+#     # Full-vocab log-sum-exp in chunks to save memory
+#     lse = torch.full((hidden.shape[0],), float('-inf'), device=device)
+#     for i in range(0, W.shape[0], 2000):
+#         partial = (hidden @ W[i:i+2000].T).float()
+#         lse = torch.logaddexp(lse, torch.logsumexp(partial, dim=-1))
+#         del partial; torch.cuda.empty_cache()
+#     log_probs = hmm_logits - lse.unsqueeze(-1)
+#     probs_hmm = log_probs.exp().detach().cpu().numpy()
+#     del hidden, hmm_logits, lse, log_probs; torch.cuda.empty_cache()
+#     ntp_llm = probs_hmm[pos_indices[:n_matched]]
+#     n = min(n_matched, len(ntp_true))
+#     return kl_divergence(ntp_true[:n], ntp_llm[:n])
 def compute_fullvocab_kl(model, hidden_cat, pos_indices, n_matched, ntp_true, tok_ids, device="cuda"):
     """Compute KL(HMM || LLM) using lm_head over full vocabulary for proper normalization."""
     from .metrics.kl import kl_divergence
-    hidden = hidden_cat.to(device)
     W = model.lm_head.weight
-    hidden = hidden.float()
-    W = W.float()
-    hmm_logits = (hidden @ W[tok_ids].T)
-    # Full-vocab log-sum-exp in chunks to save memory
-    lse = torch.full((hidden.shape[0],), float('-inf'), device=device)
-    for i in range(0, W.shape[0], 2000):
-        partial = (hidden @ W[i:i+2000].T).float()
-        lse = torch.logaddexp(lse, torch.logsumexp(partial, dim=-1))
-        del partial; torch.cuda.empty_cache()
-    log_probs = hmm_logits - lse.unsqueeze(-1)
-    probs_hmm = log_probs.exp().detach().cpu().numpy()
-    del hidden, hmm_logits, lse, log_probs; torch.cuda.empty_cache()
-    ntp_llm = probs_hmm[pos_indices[:n_matched]]
     n = min(n_matched, len(ntp_true))
-    return kl_divergence(ntp_true[:n], ntp_llm[:n])
+    ntp_llm = np.zeros((n, len(tok_ids)))
+    
+    batch_size = 512
+    for b_start in range(0, n, batch_size):
+        b_end = min(b_start + batch_size, n)
+        h = hidden_cat[pos_indices[b_start:b_end]].to(device).float()
+        
+        hmm_logits = h @ W[tok_ids].float().T
+        
+        lse = torch.full((len(h),), float('-inf'), device=device)
+        for i in range(0, W.shape[0], 2000):
+            partial = h @ W[i:i+2000].float().T
+            lse = torch.logaddexp(lse, torch.logsumexp(partial, dim=-1))
+            del partial
+        
+        log_probs = hmm_logits - lse.unsqueeze(-1)
+        ntp_llm[b_start:b_end] = log_probs.exp().detach().cpu().numpy()
+        del h, hmm_logits, lse, log_probs
+        torch.cuda.empty_cache()
+    
+    return kl_divergence(ntp_true[:n], ntp_llm)
