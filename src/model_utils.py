@@ -37,9 +37,11 @@ class ModelWrapper:
 def load_model(model_name, device="cuda"):
     cfg = MODEL_CONFIGS.get(model_name, {})
     family = cfg.get("family", _detect_family(model_name))
+    token = os.environ.get("HF_TOKEN")
     kw = dict(torch_dtype=torch.float16, device_map="auto")
+    if token: kw["token"] = token
     if cfg.get("sdpa", family != "gemma"): kw["attn_implementation"] = "sdpa"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
     model = AutoModelForCausalLM.from_pretrained(model_name, **kw); model.eval()
     wrapper = ModelWrapper(model, family)
     print(f"Loaded {model_name} ({family}): {wrapper.n_layers} layers, d={wrapper.hidden_size}")
