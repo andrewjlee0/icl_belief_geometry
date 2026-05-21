@@ -114,7 +114,9 @@ def compute_fullvocab_kl(model, hidden_cat, pos_indices, n_matched, ntp_true, to
     from .metrics.kl import kl_divergence
     hidden = hidden_cat.to(device)
     W = model.lm_head.weight
-    hmm_logits = (hidden @ W[tok_ids].T).float()
+    hidden = hidden.float()
+    W = W.float()
+    hmm_logits = (hidden @ W[tok_ids].T)
     # Full-vocab log-sum-exp in chunks to save memory
     lse = torch.full((hidden.shape[0],), float('-inf'), device=device)
     for i in range(0, W.shape[0], 2000):
