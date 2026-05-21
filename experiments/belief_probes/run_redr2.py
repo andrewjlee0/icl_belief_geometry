@@ -8,9 +8,7 @@ Trick: concatenates all k-suffix beliefs horizontally, fits ONE probe, slices RÂ
 
 Outputs: redr2_{model}.csv
 """
-import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-import argparse, gc, sys
+import argparse, gc, sys, os
 import numpy as np, pandas as pd, torch
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
