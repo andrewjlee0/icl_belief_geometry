@@ -2,6 +2,7 @@
 
 Handles Qwen, Llama, and Gemma model families.
 """
+import os
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
