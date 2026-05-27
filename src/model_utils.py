@@ -142,25 +142,26 @@ def compute_fullvocab_kl(model, hidden_cat, pos_indices, n_matched, ntp_true, to
     n = min(n_matched, len(ntp_true))
     ntp_llm = np.zeros((n, len(tok_ids)))
     
-    # Gemma hidden states are pre-final-norm; Qwen/Llama are post-norm
-    final_norm = model.model.language_model.norm if family == "gemma" else None
+    # Gemma uses logit softcapping
+    cap = None
+    if family == "gemma":
+        cap = getattr(getattr(model.config, 'text_config', model.config), 'final_logit_softcapping', None)
     
     batch_size = 512
     for b_start in range(0, n, batch_size):
         b_end = min(b_start + batch_size, n)
-        h = hidden_cat[pos_indices[b_start:b_end]].to(device)
-        
-        if final_norm is not None:
-            h = final_norm(h).float()
-        else:
-            h = h.float()
+        h = hidden_cat[pos_indices[b_start:b_end]].to(device).float()
         
         hmm_logits = h @ W[tok_ids].float().T
+        if cap is not None: hmm_logits = torch.tanh(hmm_logits / cap) * cap
+        
         lse = torch.full((len(h),), float('-inf'), device=device)
         for i in range(0, W.shape[0], 2000):
             partial = h @ W[i:i+2000].float().T
+            if cap is not None: partial = torch.tanh(partial / cap) * cap
             lse = torch.logaddexp(lse, torch.logsumexp(partial, dim=-1))
             del partial
+        
         log_probs = hmm_logits - lse.unsqueeze(-1)
         ntp_llm[b_start:b_end] = log_probs.exp().detach().cpu().numpy()
         del h, hmm_logits, lse, log_probs
