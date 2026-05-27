@@ -66,7 +66,8 @@ def main():
                 ntp_true = next_token_probs(beliefs, T)
                 ntp_o1_arr = ntp_o1_lut[tokens]
                 ntp_o0_arr = np.broadcast_to(ntp_o0_row, ntp_true.shape).copy()
-                kl_llm = compute_fullvocab_kl(wrapper.model, hidden_cat, pos_indices[:n_matched], n_matched, ntp_true, tok_ids, device)
+                # kl_llm = compute_fullvocab_kl(wrapper.model, hidden_cat, pos_indices[:n_matched], n_matched, ntp_true, tok_ids, device)
+                kl_llm = compute_fullvocab_kl(wrapper.model, hidden_cat, pos_indices[:n_matched], n_matched, ntp_true, tok_ids, device, family=wrapper.family)
                 kl_o1 = kl_divergence(ntp_true[:n_matched], ntp_o1_arr[:n_matched])
                 kl_o0 = kl_divergence(ntp_true[:n_matched], ntp_o0_arr[:n_matched])
                 del hidden_cat
