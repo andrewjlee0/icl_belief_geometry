@@ -1,20 +1,23 @@
 """Cross-family R²: probe from family A's activations to family B's beliefs,
 computed on family A's token sequence.
 
-Same logic as run_within but across families.
+Mirrors run_within.py but source and target params come from DIFFERENT families.
 Restricted to families with matching n_states: Wing ↔ Strata (both 3 states).
 
-Entry (A, B) = R² of probing family A's activations for family B's beliefs
-              on family A's token sequence.
+Entry (A_i, B_j) = R² of a probe trained from the activations produced on
+Wing param i's token sequence to the belief states computed with Strata param j
+on the same token sequence (and vice versa).
 
-Outputs: between_{model}.csv
+Two outputs:
+  - between_{model}.csv: empirical cross-family R² (activations → beliefs, WITH BIAS)
+  - gt_between_{model}.csv: ground-truth cross-family R² (beliefs_i → beliefs_j, WITH BIAS)
 """
 import argparse, gc, sys, os
 import numpy as np, pandas as pd, torch
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-from configs.hmm_configs import HMMS, REPRESENTATIVES
+from configs.hmm_configs import HMMS
 from src.hmm import stationary_distribution, sample_hmm_sequence, full_bayesian_beliefs
 from src.metrics.probes import fit_and_evaluate_multi
 from src.model_utils import (load_model, tokens_to_prompt, match_positions,
@@ -46,36 +49,48 @@ def main():
     assert len(n_states_set) == 1, f"Families have different n_states: {n_states_set}"
     print(f"Cross-family: {CROSS_FAMILIES}, n_states={n_states_set.pop()}")
 
-    # Precompute HMM params for each family — ALL params, not just representatives
-    family_hmms = {}  # {fam: [{T_stack, pi, T_matrices, param, label, token_names}, ...]}
+    # Precompute HMM params for each family
+    family_cfgs = {}
+    family_T = {}    # {fam: {label: T_stack}}
+    family_pi = {}   # {fam: {label: pi}}
+    family_labels = {}
     for fam in CROSS_FAMILIES:
         cfg = HMMS[fam]
-        family_hmms[fam] = []
+        family_cfgs[fam] = cfg
+        family_T[fam] = {}
+        family_pi[fam] = {}
+        family_labels[fam] = []
         for param in cfg["params"]:
+            label = cfg["label_fn"](param)
             T = cfg["fn"](*param)
-            family_hmms[fam].append({
-                "T_stack": np.stack(T),
-                "pi": stationary_distribution(T),
-                "T_matrices": T,
-                "param": param,
-                "label": cfg["label_fn"](param),
-                "token_names": cfg["token_names"],
-            })
+            family_T[fam][label] = np.stack(T)
+            family_pi[fam][label] = stationary_distribution(T)
+            family_labels[fam].append(label)
 
-    all_rows = []
-    total = sum(len(family_hmms[f]) for f in CROSS_FAMILIES) * args.n_seeds
-    pbar = tqdm(total=total, desc="Between")
+    cross_rows = []
 
+    # For each source family, loop over source params
     for source_fam in CROSS_FAMILIES:
-        for src in family_hmms[source_fam]:
-            tok_ids = get_tok_ids(tokenizer, src["token_names"])
+        target_fam = [f for f in CROSS_FAMILIES if f != source_fam][0]
+        src_cfg = family_cfgs[source_fam]
+        tok_ids = get_tok_ids(tokenizer, src_cfg["token_names"])
+        src_labels = family_labels[source_fam]
+        tgt_labels = family_labels[target_fam]
 
+        pbar = tqdm(total=len(src_cfg["params"]) * args.n_seeds,
+                    desc=f"{source_fam} → {target_fam}")
+
+        for source_param in src_cfg["params"]:
+            source_label = src_cfg["label_fn"](source_param)
             for seed in range(args.n_seeds):
+                # Generate source sequence
                 tokens = sample_hmm_sequence(
-                    src["T_matrices"], src["pi"], args.seq_len, seed=seed
+                    src_cfg["fn"](*source_param),
+                    family_pi[source_fam][source_label],
+                    args.seq_len, seed=seed
                 )
                 tok_i64 = tokens.astype(np.int64)
-                prompt = tokens_to_prompt(tokens, src["token_names"])
+                prompt = tokens_to_prompt(tokens, src_cfg["token_names"])
                 input_ids = tokenizer.encode(prompt, return_tensors="pt", truncation=False)
                 pos_indices, _ = match_positions(input_ids, tok_ids)
                 n_matched = min(len(tokens), len(pos_indices))
@@ -88,52 +103,123 @@ def main():
                     wrapper, input_ids, layers, late_pos, args.chunk_size, device
                 )
 
-                # Compute beliefs under ALL target params across ALL families
-                all_beliefs = {}
-                for target_fam in CROSS_FAMILIES:
-                    for tgt in family_hmms[target_fam]:
-                        key = (target_fam, tgt["label"])
-                        b = full_bayesian_beliefs(tok_i64, tgt["T_stack"], tgt["pi"])
-                        all_beliefs[key] = b[args.probe_start:n_matched]
+                # Compute beliefs under ALL target family params on this source sequence
+                beliefs = {}
+                for tgt_label in tgt_labels:
+                    b = full_bayesian_beliefs(tok_i64, family_T[target_fam][tgt_label],
+                                             family_pi[target_fam][tgt_label])
+                    beliefs[tgt_label] = b[args.probe_start:n_matched]
 
+                # Train/test split
                 idx_tr, idx_te = train_test_split(
                     np.arange(n_late), train_size=args.train_frac, random_state=seed
                 )
 
+                # Probe each layer
                 for l in layers:
                     X = acts[l]
                     if X.numel() == 0: continue
                     X_tr, X_te = X[idx_tr], X[idx_te]
 
                     targets = {}
-                    for (target_fam, target_label), y in all_beliefs.items():
+                    for tgt_label in tgt_labels:
+                        y = beliefs[tgt_label]
                         Y_tr = torch.tensor(y[idx_tr], device=device, dtype=torch.float32)
                         Y_te = torch.tensor(y[idx_te], device=device, dtype=torch.float32)
-                        targets[(target_fam, target_label)] = (Y_tr, Y_te)
+                        targets[tgt_label] = (Y_tr, Y_te)
 
                     r2s = fit_and_evaluate_multi(X_tr, X_te, targets, use_bias=True)
 
-                    for (target_fam, target_label), r2 in r2s.items():
-                        all_rows.append({
+                    for tgt_label, r2 in r2s.items():
+                        cross_rows.append({
                             "source_family": source_fam,
                             "target_family": target_fam,
-                            "source_param": src["label"],
-                            "target_param": target_label,
+                            "source_param": source_label,
+                            "target_param": tgt_label,
                             "layer": l,
                             "seed": seed,
                             "R2": r2,
-                            "self": source_fam == target_fam,
                         })
 
-                del acts, all_beliefs
+                del acts, beliefs
                 gc.collect(); torch.cuda.empty_cache()
                 pbar.update(1)
 
-    pbar.close()
-    df = pd.DataFrame(all_rows)
-    out_path = os.path.join(args.output_dir, f"between_{ms}.csv")
-    df.to_csv(out_path, index=False)
-    print(f"\nDone. {len(df)} rows saved to {out_path}")
+        pbar.close()
+
+    # Save empirical
+    df = pd.DataFrame(cross_rows)
+    df.to_csv(os.path.join(args.output_dir, f"between_{ms}.csv"), index=False)
+
+    # ═══════════════════════════════════════════════════════════
+    # Ground-truth cross-family R²: beliefs_source → beliefs_target
+    # (no model involved — how well do source beliefs linearly predict
+    #  target beliefs from a different family on the same sequence?)
+    # ═══════════════════════════════════════════════════════════
+    print("\n===== Ground-truth between-family R² =====")
+    gt_rows = []
+
+    for source_fam in CROSS_FAMILIES:
+        target_fam = [f for f in CROSS_FAMILIES if f != source_fam][0]
+        src_cfg = family_cfgs[source_fam]
+        src_labels = family_labels[source_fam]
+        tgt_labels = family_labels[target_fam]
+
+        pbar = tqdm(total=len(src_cfg["params"]) * args.n_seeds,
+                    desc=f"GT {source_fam} → {target_fam}")
+
+        for source_param in src_cfg["params"]:
+            source_label = src_cfg["label_fn"](source_param)
+            for seed in range(args.n_seeds):
+                tokens = sample_hmm_sequence(
+                    src_cfg["fn"](*source_param),
+                    family_pi[source_fam][source_label],
+                    args.seq_len, seed=seed
+                )
+                tok_i64 = tokens.astype(np.int64)
+
+                # Source beliefs (used as X)
+                b_source = full_bayesian_beliefs(
+                    tok_i64, family_T[source_fam][source_label],
+                    family_pi[source_fam][source_label]
+                )[args.probe_start:]
+
+                n = len(b_source)
+                idx_tr, idx_te = train_test_split(
+                    np.arange(n), train_size=args.train_frac, random_state=seed
+                )
+                X_tr = torch.tensor(b_source[idx_tr], device=device, dtype=torch.float32)
+                X_te = torch.tensor(b_source[idx_te], device=device, dtype=torch.float32)
+
+                # Target beliefs from other family
+                targets = {}
+                for tgt_label in tgt_labels:
+                    b_target = full_bayesian_beliefs(
+                        tok_i64, family_T[target_fam][tgt_label],
+                        family_pi[target_fam][tgt_label]
+                    )[args.probe_start:]
+                    Y_tr = torch.tensor(b_target[idx_tr], device=device, dtype=torch.float32)
+                    Y_te = torch.tensor(b_target[idx_te], device=device, dtype=torch.float32)
+                    targets[tgt_label] = (Y_tr, Y_te)
+
+                r2s = fit_and_evaluate_multi(X_tr, X_te, targets, use_bias=True)
+
+                for tgt_label, r2 in r2s.items():
+                    gt_rows.append({
+                        "source_family": source_fam,
+                        "target_family": target_fam,
+                        "source_param": source_label,
+                        "target_param": tgt_label,
+                        "seed": seed,
+                        "R2": r2,
+                    })
+
+                pbar.update(1)
+        pbar.close()
+
+    gt_df = pd.DataFrame(gt_rows)
+    gt_df.to_csv(os.path.join(args.output_dir, f"gt_between_{ms}.csv"), index=False)
+    print(f"\nDone. Cross: {len(cross_rows)} rows, GT: {len(gt_rows)} rows.")
 
     # ── Summary ──
     for (sf, tf), grp in df.groupby(["source_family", "target_family"]):
