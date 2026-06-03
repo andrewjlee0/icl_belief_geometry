@@ -76,10 +76,9 @@ def _fit(X, Y, device):
 def _continue_beliefs(start, toks, T_stack):
     """Run the Bayesian filter for |toks| steps from belief `start`.
 
-    Used for the paper-exact past-inconsistent target: `start` is the belief
-    after a fresh within-family prefix, `toks` are the source's REAL last-k
-    suffix tokens. Returns the k running beliefs (k, n_states); the last one is
-    the injected belief at the measure position N.
+    `start` is a prefix-end belief (the source's belief at i-k for past-consistent,
+    or the donor's for past-inconsistent) and `toks` are the shared donor suffix b.
+    Returns the k running beliefs (k, n_states); the last is the injected belief at N.
     """
     b = np.asarray(start, dtype=np.float64).copy()
     out = np.zeros((len(toks), b.shape[0]))
@@ -156,7 +155,7 @@ def _intervened_batch(wrapper, window_ids, layer, plan, W, device, dtype):
 
 
 # ── per-sequence driver ───────────────────────────────────────────────────────
-def run_sequence(wrapper, tokenizer, cfg, T_matrices, pi, beliefs_all, seed,
+def run_sequence(wrapper, tokenizer, cfg, T_matrices, pi, beliefs_all, tokens_all, seed,
                  layers, k_values, tok_ids, lm_head_w, cap, M, args, device, dtype,
                  pbar, n_planned_layers):
     """Fit encoder/decoder on full-context post-conv positions, then intervene
@@ -205,9 +204,10 @@ def run_sequence(wrapper, tokenizer, cfg, T_matrices, pi, beliefs_all, seed,
     eligible = np.sort(eligible)
     eval_hmm_idx = eligible[-args.n_eval:] if len(eligible) > args.n_eval else eligible
 
-    # Cyclic 1:1 donor assignment for past-inconsistent prefixes: sequence s
-    # borrows the next sequence's prefix, then the one after, etc. (mod n_seeds).
-    # With --n_draws 1 this is exactly "each uses the next one's" (0->1, ..., 9->0).
+    # Cyclic donor assignment: sequence s borrows the next sequence (its prefix
+    # for past-inconsistent, and its last-k tokens as the shared suffix b for both
+    # conditions), then the one after, etc. (mod n_seeds). With --n_draws 1 this is
+    # exactly "each uses the next one's" (0->1, ..., 9->0).
     n_seeds = args.n_seeds
     donors = [(seed + j) % n_seeds for j in range(1, args.n_draws + 1)]
     donors = [d for d in donors if d != seed] or [seed]   # exclude self; degenerate fallback
@@ -231,22 +231,22 @@ def run_sequence(wrapper, tokenizer, cfg, T_matrices, pi, beliefs_all, seed,
                          kl_to_pi_target=float("nan"), baseline_kl=baseline_kl))
 
         # Pre-sample condition target beliefs (shared across layers), per k.
-        # The suffix tokens (source's real last k) are SHARED across conditions;
-        # only the deep-history prefix differs (this is the whole design):
-        #   past_consistent  : source's own true beliefs  = filter[real prefix . real suffix]
-        #   past_inconsistent: filter[fresh within-family prefix . SAME real suffix],
-        #                      i.e. continue the filter from a donor sequence's belief
-        #                      at index (i-k) through the source's real last-k tokens.
+        # A donor (different) sequence supplies BOTH the alternate prefix and the
+        # shared suffix b = donor's last-k tokens (which differs from the source's
+        # real suffix). The prefix is the consistent/inconsistent axis:
+        #   past_consistent  : SOURCE prefix + donor suffix b
+        #                      = continue(source belief at i-k, donor's last-k tokens)
+        #   past_inconsistent: donor prefix + donor suffix b = donor's own beliefs[i-k+1:i+1]
+        #     (suffix b held fixed across the pair; only the prefix differs)
         #   random           : i.i.d. Dirichlet simplex points (direction control)
         targets = {}     # (cond, k, draw) -> belief seq (k, n_states)
         for k in k_values:
-            suffix_toks = tokens[i - k + 1:i + 1]                # real last-k tokens
-            targets[("past_consistent", k, 0)] = beliefs[i - k + 1:i + 1]
             for d in range(args.n_draws):
                 ds = donors[d % len(donors)]
-                entry = beliefs_all[ds][i - k]                   # belief after fresh prefix
-                targets[("past_inconsistent", k, d)] = _continue_beliefs(
-                    entry, suffix_toks, T_stack)
+                b_toks = tokens_all[ds][i - k + 1:i + 1]         # donor suffix b (shared by pair)
+                targets[("past_consistent", k, d)] = _continue_beliefs(
+                    beliefs[i - k], b_toks, T_stack)             # source prefix + donor suffix
+                targets[("past_inconsistent", k, d)] = beliefs_all[ds][i - k + 1:i + 1]
             for d in range(args.n_draws):                        # random control
                 targets[("random", k, d)] = rng.dirichlet(np.ones(n_states), size=k)
 
@@ -277,15 +277,15 @@ def run_sequence(wrapper, tokenizer, cfg, T_matrices, pi, beliefs_all, seed,
                 pi_ntp = {d: (targets[("past_inconsistent", k, d)][-1] @ M)
                           for d in range(args.n_draws)}
                 # patching
-                add("patch", "past_consistent", k, 0, targets[("past_consistent", k, 0)])
                 rt = predict_probe(ct[-k:], We, use_bias=True).cpu().numpy()  # enc(h)
                 add("patch", "round_trip", k, 0, rt)
                 for d in range(args.n_draws):
+                    add("patch", "past_consistent", k, d, targets[("past_consistent", k, d)])
                     add("patch", "past_inconsistent", k, d, targets[("past_inconsistent", k, d)])
                     add("patch", "random", k, d, targets[("random", k, d)], alt_ntp=pi_ntp[d])
                 # steering
-                add("steer", "past_consistent", k, 0, targets[("past_consistent", k, 0)])
                 for d in range(args.n_draws):
+                    add("steer", "past_consistent", k, d, targets[("past_consistent", k, d)])
                     add("steer", "past_inconsistent", k, d, targets[("past_inconsistent", k, d)])
                     add("steer", "random", k, d, targets[("random", k, d)], alt_ntp=pi_ntp[d])
 
@@ -382,14 +382,15 @@ def main():
             T_matrices = cfg["fn"](*param); T_stack = np.stack(T_matrices)
             pi = stationary_distribution(T_matrices)
             M = emission_matrix(T_matrices)                      # (n_states, n_tokens)
-            beliefs_all = {}                                     # donor pool (per seed)
+            beliefs_all, tokens_all = {}, {}                     # donor pool (per seed)
             for s in range(args.n_seeds):
-                tk = sample_hmm_sequence(T_matrices, pi, args.seq_len, seed=s)
-                beliefs_all[s] = full_bayesian_beliefs(tk.astype(np.int64), T_stack, pi)
+                tk = sample_hmm_sequence(T_matrices, pi, args.seq_len, seed=s).astype(np.int64)
+                tokens_all[s] = tk
+                beliefs_all[s] = full_bayesian_beliefs(tk, T_stack, pi)
             tqdm.write(f"===== {hmm_name} {label} =====")
             for seed in range(args.n_seeds):
                 all_rows += run_sequence(wrapper, tokenizer, cfg, T_matrices, pi,
-                                         beliefs_all, seed, layers, args.k_values,
+                                         beliefs_all, tokens_all, seed, layers, args.k_values,
                                          tok_ids, lm_head_w, cap, M, args, device, dtype,
                                          pbar, n_planned)
                 pd.DataFrame(all_rows).to_csv(
