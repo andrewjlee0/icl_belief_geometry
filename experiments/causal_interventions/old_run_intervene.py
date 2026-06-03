@@ -195,15 +195,15 @@ def run_sequence(wrapper, tokenizer, cfg, T_matrices, pi, beliefs_all, seed,
     layers = [l for l in layers if l in dec]
 
     # ── Choose eval (measure) positions from the held-out split ──
-    # Paper measures at the final position N; we take the n_eval positions closest
-    # to the sequence end (deterministic), averaging the effect across the sequences.
     W = args.context_window if args.context_window > 0 else None
-    rng = np.random.default_rng(seed + 999)               # used for random-control draws
-    eligible = late_idx[idx_te]
-    eligible = eligible[(pos_indices[eligible] >= (W - 1 if W else 0)) &
-                        (eligible >= max(k_values))]
-    eligible = np.sort(eligible)
-    eval_hmm_idx = eligible[-args.n_eval:] if len(eligible) > args.n_eval else eligible
+    eval_hmm_idx = late_idx[idx_te]
+    min_idx = (W - 1) if W else max(k_values)                   # window/k must fit
+    eval_hmm_idx = eval_hmm_idx[(pos_indices[eval_hmm_idx] >= (W - 1 if W else 0)) &
+                                (eval_hmm_idx >= max(k_values))]
+    rng = np.random.default_rng(seed + 999)
+    if len(eval_hmm_idx) > args.n_eval:
+        eval_hmm_idx = rng.choice(eval_hmm_idx, args.n_eval, replace=False)
+    eval_hmm_idx = np.sort(eval_hmm_idx)
 
     # Cyclic 1:1 donor assignment for past-inconsistent prefixes: sequence s
     # borrows the next sequence's prefix, then the one after, etc. (mod n_seeds).
@@ -319,13 +319,10 @@ def main():
     P.add_argument("--n_seeds", type=int, default=10)
     P.add_argument("--train_frac", type=float, default=0.2,
                    help="20/80 train/test -> ~1k train positions on the last-5k window")
-    P.add_argument("--n_eval", type=int, default=1,
-                   help="measure positions per sequence (paper uses the final position N, "
-                        "averaged across the n_seeds sequences; raise for tighter bands)")
-    P.add_argument("--context_window", type=int, default=512,
-                   help="tokens before+incl. the measure position; 0 = full context. "
-                        "512 >> max HMM mixing time (tau<=75), so the belief is reproduced; "
-                        "validate against 0 on the slowest-mixing param if unsure")
+    P.add_argument("--n_eval", type=int, default=8,
+                   help="measure positions per sequence")
+    P.add_argument("--context_window", type=int, default=1024,
+                   help="tokens before+incl. the measure position; 0 = full context")
     P.add_argument("--k_values", type=int, nargs="+", default=[1, 5, 10])
     P.add_argument("--n_draws", type=int, default=1,
                    help="donor prefixes per source (1 = cyclic 1:1, seq s borrows s+1); "
