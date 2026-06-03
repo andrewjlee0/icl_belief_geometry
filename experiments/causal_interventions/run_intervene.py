@@ -36,7 +36,6 @@ ALIGNMENT CONVENTION (matches run_r2.py, NOT the partner repo):
 """
 import argparse, gc, os, sys
 import numpy as np, pandas as pd, torch
-from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
@@ -56,6 +55,14 @@ def _kl(p, q):
     """KL(p || q) over the HMM-token simplex. p,q: (..., n_tokens)."""
     p = np.clip(p, 1e-12, None); q = np.clip(q, 1e-12, None)
     return float((p * np.log(p / q)).sum(-1))
+
+
+def _split(n, train_frac, seed):
+    """Seeded shuffled train/test index split (drop-in replacement for sklearn's
+    train_test_split(arange(n), train_size=train_frac, random_state=seed))."""
+    perm = np.random.default_rng(seed).permutation(n)
+    n_tr = int(round(n * train_frac))
+    return perm[:n_tr], perm[n_tr:]
 
 
 def _fit(X, Y, device):
@@ -174,8 +181,7 @@ def run_sequence(wrapper, tokenizer, cfg, T_matrices, pi, beliefs_all, seed,
     pbar.set_postfix_str(f"{cfg['_name']} s{seed} | fit enc/dec", refresh=True)
     acts, _ = extract_activations_chunked(wrapper, input_ids, layers, late_pos,
                                           args.chunk_size, device)
-    idx_tr, idx_te = train_test_split(np.arange(len(late_idx)),
-                                      train_size=args.train_frac, random_state=seed)
+    idx_tr, idx_te = _split(len(late_idx), args.train_frac, seed)
     y_tr = torch.tensor(y_late[idx_tr], device=device, dtype=torch.float32)
     enc, dec = {}, {}
     for l in layers:
