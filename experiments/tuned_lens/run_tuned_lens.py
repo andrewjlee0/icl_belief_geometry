@@ -107,7 +107,7 @@ def _train_translator(X_tr, target_tr, norm, Wc, cap, norm_dtype, d, device,
 
 # ── per-(hmm, param) pipeline ──────────────────────────────────────────────────
 def run_param(wrapper, tokenizer, cfg, param, layers, tok_ids, Wc, norm, cap,
-              norm_dtype, args, device):
+              norm_dtype, args, device, pbar):
     n_states = cfg["n_states"]
     T_matrices = cfg["fn"](*param); T_stack = np.stack(T_matrices)
     pi = stationary_distribution(T_matrices); M = emission_matrix(T_matrices)
@@ -178,6 +178,7 @@ def run_param(wrapper, tokenizer, cfg, param, layers, tok_ids, Wc, norm, cap,
     rows = []
     for l in layers:
         Xtr = acts_pool[l][tr].to(device); Xte = acts_pool[l][te].to(device)
+        pbar.set_postfix_str(f"{cfg['_name']} {label} | L{l}")
 
         # belief-state R2 probe (once per layer)
         try:
@@ -197,6 +198,7 @@ def run_param(wrapper, tokenizer, cfg, param, layers, tok_ids, Wc, norm, cap,
                 probs = F.softmax(_readout(Tr(Xte), norm, Wc, cap, norm_dtype), -1).cpu().numpy()
             variants[name] = (probs, tgt)
             del Tr; torch.cuda.empty_cache()
+            pbar.update(1); pbar.set_postfix_str(f"{cfg['_name']} {label} | L{l} {name}")
 
         for name, (probs, tgt) in variants.items():
             rows.append(dict(
@@ -265,8 +267,10 @@ def main():
             return [c["params"][args.param_index]] if args.param_index < len(c["params"]) else []
         return c["params"] if args.all_params else [REPRESENTATIVES[fam]]
 
-    total = sum(len(params_for(f)) for f in args.families if f in HMMS)
-    pbar = tqdm(total=total, desc="tuned-lens (hmm,param)")
+    n_trained = 2 + len(args.controls)            # tuned_concept, tuned_hmm, + each control
+    units_per_param = len(layers) * n_trained     # one translator training per (layer, target)
+    total = sum(len(params_for(f)) for f in args.families if f in HMMS) * units_per_param
+    pbar = tqdm(total=total, desc="tuned-lens (layer x target)")
     all_rows = []
     for fam in args.families:
         cfg = HMMS.get(fam)
@@ -278,10 +282,9 @@ def main():
             cfg = {**cfg, "_name": fam}
             pbar.set_postfix_str(f"{fam} {cfg['label_fn'](param)}")
             all_rows += run_param(wrapper, tokenizer, cfg, param, layers, tok_ids,
-                                  Wc, norm, cap, norm_dtype, args, device)
+                                  Wc, norm, cap, norm_dtype, args, device, pbar)
             pd.DataFrame(all_rows).to_csv(
                 os.path.join(args.output_dir, f"tunedlens_{ms}.csv"), index=False)
-            pbar.update(1)
     pbar.close()
     print("Done.")
 
