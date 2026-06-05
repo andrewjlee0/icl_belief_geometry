@@ -75,6 +75,35 @@ def _kl(p, q):
     return (p * np.log(p / q)).sum(-1)
 
 
+def _cross_donor_by_ntpkl(cfg, param, seqs, src_beliefs, M, ps):
+    """Cross-control donor = the SAME-family parametrization whose optimal next-token
+    distribution is most DIVERGENT from the source's, measured on the SOURCE sequences.
+
+    For each candidate donor p', filter the *source* token sequence under p' to get the
+    donor's beliefs, map to NTPs, and take mean KL(source_NTP || donor_NTP) over the
+    pooled window (positions >= ps) across all sequences; pick the argmax (furthest).
+    Parameter-free (no probe / regression / R2); directional (source tokens, donor NTP),
+    so no symmetrization. Returns (donor_param, mean_kl)."""
+    plist = cfg["params"]; self_lbl = cfg["label_fn"](param)
+    best, best_kl = None, -1.0
+    for p in plist:
+        if cfg["label_fn"](p) == self_lbl:
+            continue
+        dT = cfg["fn"](*p); dstack = np.stack(dT)
+        dpi = stationary_distribution(dT); dM = emission_matrix(dT)
+        tot, cnt = 0.0, 0
+        for tokens, sb in zip(seqs, src_beliefs):
+            if len(tokens) <= ps:
+                continue
+            sp = np.clip(sb[ps:] @ M, 1e-12, None)                          # source NTP
+            dq = np.clip(full_bayesian_beliefs(tokens, dstack, dpi)[ps:] @ dM, 1e-12, None)  # donor NTP, SAME seq
+            tot += (sp * np.log(sp / dq)).sum(); cnt += sp.shape[0]
+        mean_kl = tot / max(cnt, 1)
+        if mean_kl > best_kl:
+            best_kl, best = mean_kl, p
+    return best, best_kl
+
+
 def _readout(h, norm, Wc, cap, norm_dtype):
     """Concept logits = unembed_concept( final_norm(h) ). h:(B,d) fp32 -> (B,C) fp32.
     norm runs in the model's dtype; Wc is the concept slice of lm_head.weight (C,d)."""
@@ -114,18 +143,26 @@ def run_param(wrapper, tokenizer, cfg, param, layers, tok_ids, Wc, norm, cap,
     label = cfg["label_fn"](param); ps = args.probe_start
     controls = args.controls
 
-    # cross-HMM donor (same family, next parametrization) for the 'cross' control
+    # source sequences + their (source-HMM) beliefs -- analytic, no model
+    seqs, src_beliefs = [], []
+    for seed in range(args.n_seeds):
+        tk = sample_hmm_sequence(T_matrices, pi, args.seq_len, seed=seed).astype(np.int64)
+        seqs.append(tk); src_beliefs.append(full_bayesian_beliefs(tk, T_stack, pi))
+
+    # cross-HMM donor: same-family param whose NTP diverges most from the source's,
+    # measured on the SOURCE sequences (donor beliefs filtered from the source tokens).
     dstack = dpi = dM = None
     if "cross" in controls:
-        plist = cfg["params"]; di = (plist.index(param) + 1) % len(plist)
-        dT = cfg["fn"](*plist[di]); dstack = np.stack(dT)
+        dparam, dkl = _cross_donor_by_ntpkl(cfg, param, seqs, src_beliefs, M, ps)
+        if dparam is None:
+            raise ValueError("cross control needs >=2 parametrizations (use --all_params)")
+        dT = cfg["fn"](*dparam); dstack = np.stack(dT)
         dpi = stationary_distribution(dT); dM = emission_matrix(dT)
 
     acts_pool = {l: [] for l in layers}
     oracle_pool, belief_pool, o1_pool, cross_pool = [], [], [], []
     for seed in range(args.n_seeds):
-        tokens = sample_hmm_sequence(T_matrices, pi, args.seq_len, seed=seed).astype(np.int64)
-        beliefs = full_bayesian_beliefs(tokens, T_stack, pi)
+        tokens = seqs[seed]; beliefs = src_beliefs[seed]            # reuse the source seq + beliefs
         prompt = tokens_to_prompt(tokens, cfg["token_names"])
         input_ids = tokenizer.encode(prompt, return_tensors="pt", truncation=False)
         pos, _ = match_positions(input_ids, tok_ids)
