@@ -1,10 +1,11 @@
-"""Per-layer tuned lens vs. logit lens over HMM data, with belief-state R2.
+"""Per-layer tuned lens vs. logit lens over HMM data.
 
 Self-contained for this repo's HF-transformers conventions (uses src.model_utils,
-src.hmm, src.metrics.probes) — no dependency on the partner's tuned_lens_per_layer
-module. Produces, per (hmm, param, layer), the KL of each lens's next-token
-distribution to (a) the HMM oracle and (b) the model's own final output, plus the
-belief-probe R2 — everything needed for the "KL mirrors the inverted R2 curve" figure.
+src.hmm). For each (hmm, param, layer, lens, seed) it reports the KL of the lens's
+next-token distribution to (a) the HMM oracle (kl_hmm), (b) the model's own final
+output (kl_final), and (c) the lens's own training target (kl_self). One row per
+held-out sequence, so the curves can carry a 95% CI. Belief-probe R2 is NOT computed
+here -- pair these KL curves with run_r2's R2 externally.
 
 Lenses (all read out over the HMM/concept tokens only):
   logit          : final_norm + unembed applied to the layer-l residual (no training;
@@ -12,16 +13,17 @@ Lenses (all read out over the HMM/concept tokens only):
   tuned_concept  : per-layer affine translator trained to match the MODEL's own final
                    concept distribution  -> "where does the model commit its prediction".
   tuned_hmm      : per-layer affine translator trained to match the HMM ORACLE
-                   distribution           -> "where is the optimal prediction affinely
-                   readable". The headline curve: its KL-to-HMM by layer should trace
-                   the INVERSE of the belief-probe R2 curve.
+                   distribution -> "where is the optimal prediction affinely readable"
+                   (headline: its KL-to-oracle by layer should trace the INVERSE of the
+                   belief-probe R2 curve, which is computed separately by run_r2).
+  controls (opt-in via --controls): shuffle, random, order1, cross -- each a translator
+                   trained to a corrupted/alternative target; they should NOT get low.
 
-Readout: lens_logits = unembed_concept( final_norm( translator(h_l) ) ), so for the
-last layer with translator=identity it reproduces the model's own output. Alignment
-matches run_r2 / the intervention code: activation at HMM-token index i -> beliefs[i],
-oracle NTP = next_token_probs(beliefs[i]).
+Readout: lens_logits = unembed_concept( final_norm( translator(h_l) ) ), so at the last
+layer with translator=identity it reproduces the model's own output -- a built-in
+calibration check (logit & tuned_concept kl_self ~ 0 at the last layer).
 
-Output: tunedlens_{model}.csv  (rows: hmm, param, layer, lens, kl_hmm, kl_final, r2_belief)
+Output: tunedlens_{model}.csv  (rows: hmm, param, layer, lens, seed, kl_self, kl_hmm, kl_final)
 
 Usage:
     python experiments/tuned_lens/run_tuned_lens.py --model Qwen/Qwen3.5-9B \
@@ -38,8 +40,7 @@ torch.backends.cuda.matmul.allow_tf32 = True   # ~2x on Ampere; negligible effec
 torch.backends.cudnn.allow_tf32 = True
 from configs.hmm_configs import HMMS, REPRESENTATIVES
 from src.hmm import (stationary_distribution, sample_hmm_sequence,
-                     full_bayesian_beliefs, emission_matrix, next_token_probs)
-from src.metrics.probes import fit_probe, predict_probe
+                     full_bayesian_beliefs, emission_matrix)
 from src.model_utils import (load_model, tokens_to_prompt, match_positions,
                              get_tok_ids, extract_activations_chunked)
 
@@ -61,12 +62,6 @@ def _split(n, train_frac, seed):
     perm = np.random.default_rng(seed).permutation(n)
     n_tr = int(round(n * train_frac))
     return perm[:n_tr], perm[n_tr:]
-
-
-def _r2(y_true, y_pred):
-    ss_res = ((y_true - y_pred) ** 2).sum()
-    ss_tot = ((y_true - y_true.mean(0, keepdims=True)) ** 2).sum()
-    return float(1.0 - ss_res / (ss_tot + 1e-10))
 
 
 def _kl(p, q):
@@ -137,7 +132,6 @@ def _train_translator(X_tr, target_tr, norm, Wc, cap, norm_dtype, d, device,
 # ── per-(hmm, param) pipeline ──────────────────────────────────────────────────
 def run_param(wrapper, tokenizer, cfg, param, layers, tok_ids, Wc, norm, cap,
               norm_dtype, args, device, pbar):
-    n_states = cfg["n_states"]
     T_matrices = cfg["fn"](*param); T_stack = np.stack(T_matrices)
     pi = stationary_distribution(T_matrices); M = emission_matrix(T_matrices)
     label = cfg["label_fn"](param); ps = args.probe_start
@@ -160,7 +154,7 @@ def run_param(wrapper, tokenizer, cfg, param, layers, tok_ids, Wc, norm, cap,
         dpi = stationary_distribution(dT); dM = emission_matrix(dT)
 
     acts_pool = {l: [] for l in layers}
-    oracle_pool, belief_pool, o1_pool, cross_pool = [], [], [], []
+    oracle_pool, o1_pool, cross_pool, seed_pool = [], [], [], []
     for seed in range(args.n_seeds):
         tokens = seqs[seed]; beliefs = src_beliefs[seed]            # reuse the source seq + beliefs
         prompt = tokens_to_prompt(tokens, cfg["token_names"])
@@ -174,7 +168,7 @@ def run_param(wrapper, tokenizer, cfg, param, layers, tok_ids, Wc, norm, cap,
         for l in layers:
             acts_pool[l].append(acts[l].detach().cpu())
         oracle_pool.append((beliefs[ps:n] @ M).astype(np.float32))
-        belief_pool.append(beliefs[ps:n].astype(np.float32))
+        seed_pool.append(np.full(n - ps, seed, dtype=np.int64))   # which seq each position came from
         if "order1" in controls:                                 # order-1 (1-HMM) NTP
             tk = tokens[ps:n]
             ob = np.einsum("s,nsd->nd", pi, T_stack[tk]); ob /= ob.sum(1, keepdims=True)
@@ -186,9 +180,10 @@ def run_param(wrapper, tokenizer, cfg, param, layers, tok_ids, Wc, norm, cap,
 
     for l in layers:
         acts_pool[l] = torch.cat(acts_pool[l], dim=0)
-    oracle = np.concatenate(oracle_pool, 0); belief = np.concatenate(belief_pool, 0)
+    oracle = np.concatenate(oracle_pool, 0)
     N, C = oracle.shape
     tr, te = _split(N, args.train_frac, 42)
+    seed_te = np.concatenate(seed_pool, 0)[te]                # seq id for each held-out position
 
     # model's own final concept distribution = readout of the LAST layer's activation
     last = layers[-1]
@@ -217,13 +212,6 @@ def run_param(wrapper, tokenizer, cfg, param, layers, tok_ids, Wc, norm, cap,
         Xtr = acts_pool[l][tr].to(device); Xte = acts_pool[l][te].to(device)
         pbar.set_postfix_str(f"{cfg['_name']} {label} | L{l}")
 
-        # belief-state R2 probe (once per layer)
-        try:
-            Wp = fit_probe(Xtr, torch.from_numpy(belief[tr]).to(device), use_bias=True)
-        except (RuntimeError, NotImplementedError):
-            Wp = fit_probe(Xtr.cpu(), torch.from_numpy(belief[tr]), use_bias=True).to(device)
-        r2 = _r2(belief[te], predict_probe(Xte, Wp, use_bias=True).cpu().numpy())
-
         variants = {}
         with torch.no_grad():   # logit lens — untrained; self-target = model NTP
             variants["logit"] = (F.softmax(_readout(Xte, norm, Wc, cap, norm_dtype), -1).cpu().numpy(), final)
@@ -238,13 +226,17 @@ def run_param(wrapper, tokenizer, cfg, param, layers, tok_ids, Wc, norm, cap,
             pbar.update(1); pbar.set_postfix_str(f"{cfg['_name']} {label} | L{l} {name}")
 
         for name, (probs, tgt) in variants.items():
-            rows.append(dict(
-                hmm=cfg["_name"], param=label, layer=l, lens=name,
-                kl_self=float(_kl(tgt[te], probs).mean()),   # KL to this lens's own target
-                kl_hmm=float(_kl(oracle[te], probs).mean()), # KL to the real HMM oracle
-                kl_final=float(_kl(final[te], probs).mean()),# KL to the model's own NTP
-                r2_belief=r2,
-            ))
+            ks = _kl(tgt[te], probs)        # per-position KL to this lens's own target
+            kh = _kl(oracle[te], probs)     # per-position KL to the real HMM oracle
+            kf = _kl(final[te], probs)      # per-position KL to the model's own NTP
+            for sd in np.unique(seed_te):   # one row per held-out sequence -> replicates for CIs
+                m = seed_te == sd
+                rows.append(dict(
+                    hmm=cfg["_name"], param=label, layer=l, lens=name, seed=int(sd),
+                    kl_self=float(ks[m].mean()),
+                    kl_hmm=float(kh[m].mean()),
+                    kl_final=float(kf[m].mean()),
+                ))
         del Xtr, Xte; torch.cuda.empty_cache()
     del acts_pool; gc.collect(); torch.cuda.empty_cache()
     return rows
