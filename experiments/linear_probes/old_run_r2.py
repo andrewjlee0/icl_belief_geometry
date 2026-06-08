@@ -1,8 +1,6 @@
 """R² probing with shuffled/random controls + geometry extraction at best layer.
 
 Outputs: r2_{model}.csv, geom_{model}.npz
-Geometry is now extracted for ALL parametrizations (not just representatives), each at
-its own best (peak-R²) layer, so all 40 geometries can be visualized in a 4x10 grid.
 """
 import argparse, gc, sys, os
 import numpy as np, pandas as pd, torch
@@ -35,7 +33,7 @@ def main():
     all_rows = []
     families = args.families or list(HMMS.keys())
     for hmm_name in families:
-        cfg = HMMS.get(hmm_name)
+        cfg = HMMS.get(hmm_name); 
         if not cfg: continue
         print(f"\n===== {hmm_name} =====")
         tok_ids = get_tok_ids(tokenizer, cfg["token_names"])
@@ -61,7 +59,7 @@ def main():
                 idx_tr, idx_te = train_test_split(np.arange(n_late), train_size=args.train_frac, random_state=seed)
                 tgts_np = {"real": y_real, "shuffle": y_shuffle, "random": y_random}
                 for l in layers:
-                    X = acts[l]
+                    X = acts[l]; 
                     if X.numel() == 0: continue
                     tgts = {t: (torch.tensor(y[idx_tr],device=device,dtype=torch.float32),
                                torch.tensor(y[idx_te],device=device,dtype=torch.float32)) for t,y in tgts_np.items()}
@@ -72,45 +70,37 @@ def main():
         pbar.close()
         pd.DataFrame(all_rows).to_csv(os.path.join(args.output_dir, f"r2_{ms}.csv"), index=False)
 
-    # ── Geometry extraction at best layer (ALL params) ──
-    # Uses float64 for precise geometry visualization. One geometry per (hmm, param),
-    # at that param's peak-R² layer. Keys use a "__" separator since labels contain
-    # commas/spaces (e.g. "a=0.97, t0=0.38, t1=0.54").
+    # ── Geometry extraction at best layer (representatives only) ──
+    # Uses float64 for precise geometry visualization
     r2_df = pd.DataFrame(all_rows)
     geom = {}
-    for hmm_name in families:
-        cfg = HMMS.get(hmm_name)
+    for hmm_name, rep_param in REPRESENTATIVES.items():
+        cfg = HMMS.get(hmm_name); 
         if not cfg or hmm_name not in r2_df["hmm"].values: continue
+        label = cfg["label_fn"](rep_param)
+        sub = r2_df[(r2_df["hmm"]==hmm_name)&(r2_df["param"]==label)&(r2_df["target"]=="real")]
+        if len(sub)==0: continue
+        best_layer = int(sub.groupby("layer")["R2"].mean().idxmax())
+        T = cfg["fn"](*rep_param); T_stack = np.stack(T); pi = stationary_distribution(T)
         tok_ids = get_tok_ids(tokenizer, cfg["token_names"])
-        for param in cfg["params"]:
-            label = cfg["label_fn"](param)
-            sub = r2_df[(r2_df["hmm"]==hmm_name)&(r2_df["param"]==label)&(r2_df["target"]=="real")]
-            if len(sub)==0: continue
-            layer_means = sub.groupby("layer")["R2"].mean()
-            best_layer = int(layer_means.idxmax())
-            best_r2 = float(layer_means.max())
-            T = cfg["fn"](*param); T_stack = np.stack(T); pi = stationary_distribution(T)
-            tokens = sample_hmm_sequence(T, pi, args.seq_len, seed=0)
-            beliefs = full_bayesian_beliefs(tokens.astype(np.int64), T_stack, pi)
-            prompt = tokens_to_prompt(tokens, cfg["token_names"])
-            input_ids = tokenizer.encode(prompt, return_tensors="pt", truncation=False)
-            pos_indices, _ = match_positions(input_ids, tok_ids)
-            n_matched = min(len(tokens), len(pos_indices))
-            late_pos = pos_indices[args.probe_start:n_matched]
-            y_true = beliefs[args.probe_start:n_matched]
-            acts, _ = extract_activations_chunked(wrapper, input_ids, [best_layer], late_pos, args.chunk_size, device)
-            X = acts[best_layer]
-            W = fit_probe(X.double(), torch.tensor(y_true, device=device, dtype=torch.float64), use_bias=True)
-            y_pred = predict_probe(X.double(), W, use_bias=True).cpu().numpy()
-            key = f"{hmm_name}__{label}"
-            geom[key] = {"true": y_true, "pred": y_pred,
-                         "best_layer": best_layer, "r2": best_r2, "param": label}
-            del acts; gc.collect(); torch.cuda.empty_cache()
-            print(f"  {hmm_name} [{label}] geom: layer {best_layer}, R²={best_r2:.4f}")
-
+        tokens = sample_hmm_sequence(T, pi, args.seq_len, seed=0)
+        beliefs = full_bayesian_beliefs(tokens.astype(np.int64), T_stack, pi)
+        prompt = tokens_to_prompt(tokens, cfg["token_names"])
+        input_ids = tokenizer.encode(prompt, return_tensors="pt", truncation=False)
+        pos_indices, _ = match_positions(input_ids, tok_ids)
+        n_matched = min(len(tokens), len(pos_indices))
+        late_pos = pos_indices[args.probe_start:n_matched]
+        y_true = beliefs[args.probe_start:n_matched]
+        acts, _ = extract_activations_chunked(wrapper, input_ids, [best_layer], late_pos, args.chunk_size, device)
+        X = acts[best_layer]
+        W = fit_probe(X.double(), torch.tensor(y_true, device=device, dtype=torch.float64), use_bias=True)
+        y_pred = predict_probe(X.double(), W, use_bias=True).cpu().numpy()
+        geom[hmm_name] = {"true": y_true, "pred": y_pred, "best_layer": best_layer, "param": label}
+        del acts; gc.collect(); torch.cuda.empty_cache()
+        print(f"  {hmm_name} geom: layer {best_layer}, R²={compute_r2(torch.tensor(y_true), torch.tensor(y_pred)):.4f}")
     np.savez(os.path.join(args.output_dir, f"geom_{ms}.npz"),
              **{f"{k}_{v}": (np.array(geom[k][v]) if not isinstance(geom[k][v], np.ndarray) else geom[k][v])
-                for k in geom for v in ["true", "pred", "best_layer", "r2", "param"]})
+                for k in geom for v in ["true", "pred", "best_layer", "param"]})
     print("Done.")
 
 if __name__ == "__main__": main()
