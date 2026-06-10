@@ -5,4 +5,6 @@
 *.log
 *venv
 /results
-/plots
+/plots__pycache__/
+.ipynb_checkpoints/
+.DS_Store
