@@ -28,6 +28,12 @@ HMMS = {
         "label_fn": lambda p: f"a={p[0]}, t0={p[1]}, t1={p[2]}",
         "token_names": np.array(["F","Q"]), "n_tokens": 2, "n_states": 3,
     },
+    "Delay": {
+        "fn": delay_matrices, "order_one_fn": None, "order_zero_fn": None,
+        "params": [(0.10, 0.002), (0.05, 0.002), (0.10, 0.005)],
+        "label_fn": lambda p: f"eps={p[0]}, x={p[1]}",
+        "token_names": np.array(["F","Q","V"]), "n_tokens": 3, "n_states": 4,
+    },
     "Spiral": {
         "fn": spiral_matrices, "order_one_fn": spiral_order_one, "order_zero_fn": spiral_order_zero,
         "params": [(a,) for a in np.arange(0.01, 0.11, 0.01).round(2)],
@@ -35,4 +41,4 @@ HMMS = {
         "token_names": np.array(["F","Q"]), "n_tokens": 2, "n_states": 3,
     },
 }
-REPRESENTATIVES = {"Mess3": (0.01,0.02), "Arch": (0.9,), "Wing": (0.98,0.4), "Strata": (0.97,0.38,0.54)}
+REPRESENTATIVES = {"Delay": (0.10,0.002), "Mess3": (0.01,0.02), "Arch": (0.9,), "Wing": (0.98,0.4), "Strata": (0.97,0.38,0.54)}

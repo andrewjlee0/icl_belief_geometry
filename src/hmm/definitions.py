@@ -79,3 +79,22 @@ def spiral_order_one(alpha):
     return [np.array([[n1/d1,0],[n2/d2,0]]),np.array([[0,-n2/d1],[0,-n3/d2]])]
 def spiral_order_zero(alpha):
     return [np.array([[(5+9*alpha)/60]]),np.array([[(55-9*alpha)/60]])]
+
+
+# ── Delay: 4 states, 3 tokens. Alternating delayed-revelation process ──
+# states {0:A1, 1:A2, 2:B, 3:C}. Quiet phase: A1/A2 self-loop emitting token 0 ('F'),
+# noise x on tokens 1/2; hazard alpha-complement eps: A1->B, A2->C (silently).
+# Reveal SWITCHES the regime: B emits token 1 -> A2; C emits token 2 -> A1
+# (so true reveals alternate 1,2,1,2,...). The emission rows of A1 and A2 are
+# IDENTICAL, so delta = e_A1 - e_A2 is exactly ker(M): during the quiet phase the
+# regime coordinate of the belief has zero effect on the current NTP but fully
+# determines which reveal token comes next. Kernel is behaviorally loaded at a delay.
+def delay_matrices(eps, x):
+    A = np.zeros((3, 4, 4))
+    for (s, tgt) in [(0, 2), (1, 3)]:                # A1->B, A2->C hazards
+        A[0][s, s] = (1 - 2*x) * (1 - eps); A[0][s, tgt] = (1 - 2*x) * eps
+        A[1][s, s] = x * (1 - eps);         A[1][s, tgt] = x * eps
+        A[2][s, s] = x * (1 - eps);         A[2][s, tgt] = x * eps
+    A[1][2, 1] = 1 - 2*x; A[0][2, 1] = x; A[2][2, 1] = x   # B: emit 1 -> A2 (switch)
+    A[2][3, 0] = 1 - 2*x; A[0][3, 0] = x; A[1][3, 0] = x   # C: emit 2 -> A1 (switch)
+    return [A[0], A[1], A[2]]

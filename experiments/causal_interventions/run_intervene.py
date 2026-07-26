@@ -177,11 +177,13 @@ def run_sequence(wrapper, tokenizer, cfg, T_matrices, pi, beliefs_all, tokens_al
     late_idx = np.arange(args.probe_start, n_matched)           # HMM-token indices
     late_pos = pos_indices[late_idx]
     y_late = beliefs[late_idx]
+    # --source log_ntp: fit enc/dec in log-NTP coordinates (targets/KL stay in NTP space)
+    y_fit = np.log(y_late @ M + 1e-12) if args.source == "log_ntp" else y_late
     pbar.set_postfix_str(f"{cfg['_name']} s{seed} | fit enc/dec", refresh=True)
     acts, _ = extract_activations_chunked(wrapper, input_ids, layers, late_pos,
                                           args.chunk_size, device)
     idx_tr, idx_te = _split(len(late_idx), args.train_frac, seed)
-    y_tr = torch.tensor(y_late[idx_tr], device=device, dtype=torch.float32)
+    y_tr = torch.tensor(y_fit[idx_tr], device=device, dtype=torch.float32)
     enc, dec = {}, {}
     for l in layers:
         X = acts[l]
@@ -255,9 +257,21 @@ def run_sequence(wrapper, tokenizer, cfg, T_matrices, pi, beliefs_all, tokens_al
             ct = clean_tail[l]                                   # (max_k, d), fp32
             plan, meta = [], []                                  # parallel lists
 
-            def add(mode, cond, k, draw, belief_seq, alt_ntp=None):
-                bt = torch.tensor(np.asarray(belief_seq), device=device,
-                                  dtype=torch.float32)
+            def add(mode, cond, k, draw, belief_seq, alt_ntp=None, is_source=False):
+                # belief_seq is a BELIEF sequence unless is_source=True (already in
+                # enc/dec coordinates, e.g. the round-trip enc(h)).
+                arr = np.asarray(belief_seq)
+                if is_source:
+                    src_np = arr
+                    if args.source == "log_ntp":                 # p_tgt from log-NTP coords
+                        e = np.exp(arr[-1]); p_tgt = e / e.sum()
+                    else:
+                        p_tgt = arr[-1] @ M
+                else:
+                    src_np = np.log(arr @ M + 1e-12) if args.source == "log_ntp" else arr
+                    # NTP implied by the injected belief at the MEASURE position:
+                    p_tgt = arr[-1] @ M
+                bt = torch.tensor(src_np, device=device, dtype=torch.float32)
                 dec_t = predict_probe(bt, Wd, use_bias=True)     # (k, d)
                 if mode == "steer":
                     src = predict_probe(predict_probe(ct[-k:], We, use_bias=True),
@@ -267,8 +281,6 @@ def run_sequence(wrapper, tokenizer, cfg, T_matrices, pi, beliefs_all, tokens_al
                     value = dec_t
                 offsets = torch.arange(Wlen - k, Wlen, dtype=torch.long)
                 plan.append(dict(offsets=offsets, mode=mode, value=value))
-                # NTP implied by the injected belief at the MEASURE position:
-                p_tgt = (np.asarray(belief_seq)[-1] @ M)
                 meta.append((mode, cond, k, draw, p_tgt, alt_ntp))
 
             for k in k_values:
@@ -278,7 +290,7 @@ def run_sequence(wrapper, tokenizer, cfg, T_matrices, pi, beliefs_all, tokens_al
                           for d in range(args.n_draws)}
                 # patching
                 rt = predict_probe(ct[-k:], We, use_bias=True).cpu().numpy()  # enc(h)
-                add("patch", "round_trip", k, 0, rt)
+                add("patch", "round_trip", k, 0, rt, is_source=True)
                 for d in range(args.n_draws):
                     add("patch", "past_consistent", k, d, targets[("past_consistent", k, d)])
                     add("patch", "past_inconsistent", k, d, targets[("past_inconsistent", k, d)])
@@ -335,6 +347,9 @@ def main():
     P.add_argument("--device", default="cuda")
     P.add_argument("--smoke", action="store_true",
                    help="tiny local plumbing test (1 seed, 2 layers, short window)")
+    P.add_argument("--source", choices=["belief", "log_ntp"], default="belief",
+                   help="coordinates for the enc/dec + injection (targets and KLs are "
+                        "always in NTP space, so arms are directly comparable)")
     args = P.parse_args()
 
     if args.smoke:                       # fast end-to-end check, NOT scientific output
@@ -393,8 +408,9 @@ def main():
                                          beliefs_all, tokens_all, seed, layers, args.k_values,
                                          tok_ids, lm_head_w, cap, M, args, device, dtype,
                                          pbar, n_planned)
+                suffix = "" if args.source == "belief" else f"_{args.source.replace('_','')}"
                 pd.DataFrame(all_rows).to_csv(
-                    os.path.join(args.output_dir, f"intervene_{ms}.csv"), index=False)
+                    os.path.join(args.output_dir, f"intervene_{ms}{suffix}.csv"), index=False)
     pbar.close()
     print("Done.")
 
