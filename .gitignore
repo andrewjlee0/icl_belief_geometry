@@ -17,3 +17,6 @@ __pycache__/
 *.svg
 *.gif
 *.html
+
+# kept local only (not part of the public repo)
+plots/analyze_destroy.ipynb
